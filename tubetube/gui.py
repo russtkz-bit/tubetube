@@ -34,6 +34,7 @@ class TubetubeApp:
         self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self._worker: threading.Thread | None = None
         self._cancel_event: threading.Event | None = None
+        self._last_results: list[Path] = []
 
         self._build_widgets()
         self.root.after(100, self._poll_queues)
@@ -49,19 +50,24 @@ class TubetubeApp:
 
         ttk.Label(form, text="Ссылка на видео или плейлист:").grid(row=0, column=0, sticky="w")
         self.url_var = tk.StringVar()
-        ttk.Entry(form, textvariable=self.url_var).grid(row=0, column=1, columnspan=3, sticky="ew", **pad)
+        url_entry = ttk.Entry(form, textvariable=self.url_var)
+        url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+        ttk.Button(form, text="Вставить", command=self._on_paste_url).grid(row=0, column=3, **pad)
+        self._add_entry_context_menu(url_entry)
 
         ttk.Label(form, text="Языки (через запятую, или 'all'):").grid(row=1, column=0, sticky="w")
         self.langs_var = tk.StringVar(value="ru,en")
-        ttk.Entry(form, textvariable=self.langs_var, width=20).grid(row=1, column=1, sticky="w", **pad)
+        langs_entry = ttk.Entry(form, textvariable=self.langs_var, width=20)
+        langs_entry.grid(row=1, column=1, sticky="w", **pad)
+        self._add_entry_context_menu(langs_entry)
 
         ttk.Label(form, text="Фильтр по названию видео (regex, необязательно):").grid(
             row=2, column=0, sticky="w"
         )
         self.title_filter_var = tk.StringVar(value="")
-        ttk.Entry(form, textvariable=self.title_filter_var).grid(
-            row=2, column=1, columnspan=2, sticky="ew", **pad
-        )
+        title_filter_entry = ttk.Entry(form, textvariable=self.title_filter_var)
+        title_filter_entry.grid(row=2, column=1, columnspan=2, sticky="ew", **pad)
+        self._add_entry_context_menu(title_filter_entry)
         self.preview_button = ttk.Button(
             form, text="Предпросмотр", command=self._on_preview_playlist
         )
@@ -69,8 +75,10 @@ class TubetubeApp:
 
         ttk.Label(form, text="Папка для сохранения:").grid(row=3, column=0, sticky="w")
         self.output_var = tk.StringVar(value=str(Path.cwd() / "subtitles"))
-        ttk.Entry(form, textvariable=self.output_var).grid(row=3, column=1, columnspan=2, sticky="ew", **pad)
+        output_entry = ttk.Entry(form, textvariable=self.output_var)
+        output_entry.grid(row=3, column=1, columnspan=2, sticky="ew", **pad)
         ttk.Button(form, text="Обзор...", command=self._choose_folder).grid(row=3, column=3, **pad)
+        self._add_entry_context_menu(output_entry)
 
         type_frame = ttk.LabelFrame(form, text="Тип субтитров")
         type_frame.grid(row=4, column=0, columnspan=4, sticky="ew", **pad)
@@ -111,6 +119,10 @@ class TubetubeApp:
         self.cancel_button.pack(side="left", padx=4)
         self.open_folder_button = ttk.Button(buttons, text="Открыть папку", command=self._open_output_folder)
         self.open_folder_button.pack(side="left", padx=4)
+        self.copy_paths_button = ttk.Button(
+            buttons, text="Копировать пути", command=self._on_copy_paths, state="disabled"
+        )
+        self.copy_paths_button.pack(side="left", padx=4)
         self.update_button = ttk.Button(
             buttons, text="Обновить yt-dlp", command=self._on_update_yt_dlp
         )
@@ -133,6 +145,7 @@ class TubetubeApp:
         log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.log_widget = scrolledtext.ScrolledText(log_frame, state="disabled", wrap="word")
         self.log_widget.pack(fill="both", expand=True)
+        self._add_text_context_menu(self.log_widget)
 
         self.status_var = tk.StringVar(value="Готово")
         ttk.Label(self.root, textvariable=self.status_var, anchor="w").pack(fill="x", padx=8, pady=(0, 4))
@@ -157,6 +170,65 @@ class TubetubeApp:
             subprocess.Popen(["open", str(path)])
         else:
             subprocess.Popen(["xdg-open", str(path)])
+
+    def _add_entry_context_menu(self, widget: tk.Entry) -> None:
+        """Правый клик на поле ввода — Вырезать/Копировать/Вставить/Выделить всё.
+
+        Обычный Ctrl+V/Ctrl+C и так работают в полях Tkinter «из коробки»,
+        но не все об этом знают — контекстное меню делает буфер обмена
+        явным и доступным без клавиатурных сочетаний."""
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+        menu.add_separator()
+
+        def select_all():
+            widget.select_range(0, "end")
+            widget.icursor("end")
+
+        menu.add_command(label="Выделить всё", command=select_all)
+
+        def popup(event):
+            widget.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+
+        widget.bind("<Button-3>", popup)
+
+    def _add_text_context_menu(self, widget: tk.Text) -> None:
+        """Правый клик на поле лога (только для чтения) — Копировать/Выделить всё."""
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: widget.tag_add("sel", "1.0", "end"))
+
+        def popup(event):
+            menu.tk_popup(event.x_root, event.y_root)
+
+        widget.bind("<Button-3>", popup)
+
+    def _on_paste_url(self) -> None:
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            messagebox.showinfo(APP_TITLE, "В буфере обмена нет текста.")
+            return
+        text = text.strip()
+        if text:
+            self.url_var.set(text)
+
+    def _set_last_results(self, results: list[Path]) -> None:
+        self._last_results = results
+        self.copy_paths_button.configure(state="normal" if results else "disabled")
+
+    def _on_copy_paths(self) -> None:
+        if not self._last_results:
+            return
+        text = "\n".join(str(p) for p in self._last_results)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+        self.status_var.set(f"Скопировано путей в буфер обмена: {len(self._last_results)}")
 
     def _log(self, message: str) -> None:
         self._log_queue.put(message)
@@ -198,6 +270,9 @@ class TubetubeApp:
         self.update_button.configure(state=state)
         self.git_pull_button.configure(
             state=state if (not busy and self._git_pull_available) else "disabled"
+        )
+        self.copy_paths_button.configure(
+            state=state if (not busy and self._last_results) else "disabled"
         )
         self.cancel_button.configure(state="normal" if (busy and cancellable) else "disabled")
         self.status_var.set(status)
@@ -335,6 +410,7 @@ class TubetubeApp:
                 self._log(f"Готово. Сохранено файлов: {len(results)}")
                 for path in results:
                     self._log(f"  - {path}")
+                self._post(lambda: self._set_last_results(results))
                 self._post(
                     lambda: messagebox.showinfo(
                         APP_TITLE, f"Готово! Сохранено файлов субтитров: {len(results)}"
