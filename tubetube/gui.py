@@ -8,8 +8,14 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import Callable
 
-from .downloader import DownloadError, download_subtitles, list_available_languages
+from .downloader import (
+    DownloadError,
+    OperationCancelled,
+    download_subtitles,
+    list_available_languages,
+)
 from .updater import UpdateError, current_version, git_pull, is_git_checkout, update_yt_dlp
 
 APP_TITLE = "tubetube — субтитры YouTube"
@@ -23,10 +29,12 @@ class TubetubeApp:
         root.minsize(640, 480)
 
         self._log_queue: "queue.Queue[str]" = queue.Queue()
+        self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self._worker: threading.Thread | None = None
+        self._cancel_event: threading.Event | None = None
 
         self._build_widgets()
-        self.root.after(100, self._poll_log_queue)
+        self.root.after(100, self._poll_queues)
 
     # ------------------------------------------------------------------ UI
 
@@ -85,6 +93,8 @@ class TubetubeApp:
         self.langs_button.pack(side="left", padx=4)
         self.download_button = ttk.Button(buttons, text="Скачать субтитры", command=self._on_download)
         self.download_button.pack(side="left", padx=4)
+        self.cancel_button = ttk.Button(buttons, text="Отмена", command=self._on_cancel, state="disabled")
+        self.cancel_button.pack(side="left", padx=4)
         self.open_folder_button = ttk.Button(buttons, text="Открыть папку", command=self._open_output_folder)
         self.open_folder_button.pack(side="left", padx=4)
         self.update_button = ttk.Button(
@@ -137,7 +147,18 @@ class TubetubeApp:
     def _log(self, message: str) -> None:
         self._log_queue.put(message)
 
-    def _poll_log_queue(self) -> None:
+    def _post(self, fn: Callable[[], None]) -> None:
+        """Планирует fn на выполнение в главном (GUI) потоке.
+
+        Tkinter не гарантированно потокобезопасен при прямом вызове его
+        методов (в т.ч. root.after) из фонового потока — это иногда
+        приводит к редкой гонке ("main thread is not in main loop").
+        Поэтому все действия из фоновых потоков идут через эту очередь,
+        которую опрашивает только главный поток (см. _poll_queues).
+        """
+        self._ui_queue.put(fn)
+
+    def _poll_queues(self) -> None:
         try:
             while True:
                 message = self._log_queue.get_nowait()
@@ -147,9 +168,15 @@ class TubetubeApp:
                 self.log_widget.configure(state="disabled")
         except queue.Empty:
             pass
-        self.root.after(100, self._poll_log_queue)
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                fn()
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_queues)
 
-    def _set_busy(self, busy: bool, status: str) -> None:
+    def _set_busy(self, busy: bool, status: str, cancellable: bool = False) -> None:
         state = "disabled" if busy else "normal"
         self.langs_button.configure(state=state)
         self.download_button.configure(state=state)
@@ -157,11 +184,14 @@ class TubetubeApp:
         self.git_pull_button.configure(
             state=state if (not busy and self._git_pull_available) else "disabled"
         )
+        self.cancel_button.configure(state="normal" if (busy and cancellable) else "disabled")
         self.status_var.set(status)
         if busy:
             self.progress.start(12)
         else:
             self.progress.stop()
+        if not busy:
+            self._cancel_event = None
 
     def _run_in_thread(self, target) -> None:
         if self._worker and self._worker.is_alive():
@@ -169,6 +199,24 @@ class TubetubeApp:
             return
         self._worker = threading.Thread(target=target, daemon=True)
         self._worker.start()
+
+    def _run_cancellable_in_thread(self, target) -> "threading.Event | None":
+        """Как _run_in_thread, но заводит cancel_event и передаёт его в target(cancel_event)."""
+        if self._worker and self._worker.is_alive():
+            messagebox.showinfo(APP_TITLE, "Дождитесь завершения текущей операции.")
+            return None
+        cancel_event = threading.Event()
+        self._cancel_event = cancel_event
+        self._worker = threading.Thread(target=target, args=(cancel_event,), daemon=True)
+        self._worker.start()
+        return cancel_event
+
+    def _on_cancel(self) -> None:
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+            self.cancel_button.configure(state="disabled")
+            self.status_var.set("Отмена...")
+            self._log("Запрошена отмена — операция остановится при первой возможности...")
 
     def _get_langs(self) -> list[str]:
         raw = self.langs_var.get().strip()
@@ -182,20 +230,25 @@ class TubetubeApp:
             messagebox.showwarning(APP_TITLE, "Укажите ссылку на видео или плейлист.")
             return
 
-        def task():
-            self.root.after(0, lambda: self._set_busy(True, "Получение списка языков..."))
+        def task(cancel_event):
+            self._post(lambda: self._set_busy(True, "Получение списка языков...", cancellable=True))
+            final_status = "Готово"
             try:
-                manual, auto = list_available_languages(url, on_log=self._log)
+                manual, auto = list_available_languages(url, on_log=self._log, cancel_event=cancel_event)
                 self._log("")
                 self._log("Авторские субтитры (manual): " + (", ".join(sorted(manual)) or "нет"))
                 self._log("Автоматические субтитры (auto): " + (", ".join(sorted(auto)) or "нет"))
+            except OperationCancelled as exc:
+                self._log(f"Отменено: {exc}")
+                final_status = "Отменено"
             except DownloadError as exc:
                 self._log(f"Ошибка: {exc}")
-                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, str(exc)))
+                self._post(lambda exc=exc: messagebox.showerror(APP_TITLE, str(exc)))
+                final_status = "Ошибка"
             finally:
-                self.root.after(0, lambda: self._set_busy(False, "Готово"))
+                self._post(lambda s=final_status: self._set_busy(False, s))
 
-        self._run_in_thread(task)
+        self._run_cancellable_in_thread(task)
 
     def _on_download(self) -> None:
         url = self.url_var.get().strip()
@@ -208,8 +261,9 @@ class TubetubeApp:
         fmt = self.format_var.get()
         keep_vtt = self.keep_vtt_var.get()
 
-        def task():
-            self.root.after(0, lambda: self._set_busy(True, "Скачивание субтитров..."))
+        def task(cancel_event):
+            self._post(lambda: self._set_busy(True, "Скачивание субтитров...", cancellable=True))
+            final_status = "Готово"
             try:
                 self._log(f"Начинаю: {url}")
                 results = download_subtitles(
@@ -220,51 +274,55 @@ class TubetubeApp:
                     fmt=fmt,
                     keep_vtt=keep_vtt,
                     on_log=self._log,
+                    cancel_event=cancel_event,
                 )
                 self._log("")
                 self._log(f"Готово. Сохранено файлов: {len(results)}")
                 for path in results:
                     self._log(f"  - {path}")
-                self.root.after(
-                    0,
+                self._post(
                     lambda: messagebox.showinfo(
                         APP_TITLE, f"Готово! Сохранено файлов субтитров: {len(results)}"
-                    ),
+                    )
                 )
+            except OperationCancelled as exc:
+                self._log(f"Отменено: {exc}")
+                final_status = "Отменено"
             except DownloadError as exc:
                 self._log(f"Ошибка: {exc}")
-                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, str(exc)))
+                self._post(lambda exc=exc: messagebox.showerror(APP_TITLE, str(exc)))
+                final_status = "Ошибка"
             finally:
-                self.root.after(0, lambda: self._set_busy(False, "Готово"))
+                self._post(lambda s=final_status: self._set_busy(False, s))
 
-        self._run_in_thread(task)
+        self._run_cancellable_in_thread(task)
 
     def _on_update_yt_dlp(self) -> None:
         def task():
-            self.root.after(0, lambda: self._set_busy(True, "Обновление yt-dlp..."))
+            self._post(lambda: self._set_busy(True, "Обновление yt-dlp..."))
             try:
                 result = update_yt_dlp(on_log=self._log)
-                self.root.after(0, lambda: self.version_var.set(f"yt-dlp: {current_version()} (см. лог)"))
-                self.root.after(0, lambda: messagebox.showinfo(APP_TITLE, result))
+                self._post(lambda: self.version_var.set(f"yt-dlp: {current_version()} (см. лог)"))
+                self._post(lambda: messagebox.showinfo(APP_TITLE, result))
             except UpdateError as exc:
                 self._log(f"Ошибка обновления: {exc}")
-                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, str(exc)))
+                self._post(lambda exc=exc: messagebox.showerror(APP_TITLE, str(exc)))
             finally:
-                self.root.after(0, lambda: self._set_busy(False, "Готово"))
+                self._post(lambda: self._set_busy(False, "Готово"))
 
         self._run_in_thread(task)
 
     def _on_git_pull(self) -> None:
         def task():
-            self.root.after(0, lambda: self._set_busy(True, "Обновление кода tubetube..."))
+            self._post(lambda: self._set_busy(True, "Обновление кода tubetube..."))
             try:
                 result = git_pull(on_log=self._log)
-                self.root.after(0, lambda: messagebox.showinfo(APP_TITLE, result))
+                self._post(lambda: messagebox.showinfo(APP_TITLE, result))
             except UpdateError as exc:
                 self._log(f"Ошибка обновления: {exc}")
-                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, str(exc)))
+                self._post(lambda exc=exc: messagebox.showerror(APP_TITLE, str(exc)))
             finally:
-                self.root.after(0, lambda: self._set_busy(False, "Готово"))
+                self._post(lambda: self._set_busy(False, "Готово"))
 
         self._run_in_thread(task)
 
