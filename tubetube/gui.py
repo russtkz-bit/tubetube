@@ -13,8 +13,10 @@ from typing import Callable
 from .downloader import (
     DownloadError,
     OperationCancelled,
+    compile_title_filter,
     download_subtitles,
     list_available_languages,
+    list_playlist_entries,
 )
 from .updater import UpdateError, current_version, git_pull, is_git_checkout, update_yt_dlp
 
@@ -53,13 +55,25 @@ class TubetubeApp:
         self.langs_var = tk.StringVar(value="ru,en")
         ttk.Entry(form, textvariable=self.langs_var, width=20).grid(row=1, column=1, sticky="w", **pad)
 
-        ttk.Label(form, text="Папка для сохранения:").grid(row=2, column=0, sticky="w")
+        ttk.Label(form, text="Фильтр по названию видео (regex, необязательно):").grid(
+            row=2, column=0, sticky="w"
+        )
+        self.title_filter_var = tk.StringVar(value="")
+        ttk.Entry(form, textvariable=self.title_filter_var).grid(
+            row=2, column=1, columnspan=2, sticky="ew", **pad
+        )
+        self.preview_button = ttk.Button(
+            form, text="Предпросмотр", command=self._on_preview_playlist
+        )
+        self.preview_button.grid(row=2, column=3, **pad)
+
+        ttk.Label(form, text="Папка для сохранения:").grid(row=3, column=0, sticky="w")
         self.output_var = tk.StringVar(value=str(Path.cwd() / "subtitles"))
-        ttk.Entry(form, textvariable=self.output_var).grid(row=2, column=1, columnspan=2, sticky="ew", **pad)
-        ttk.Button(form, text="Обзор...", command=self._choose_folder).grid(row=2, column=3, **pad)
+        ttk.Entry(form, textvariable=self.output_var).grid(row=3, column=1, columnspan=2, sticky="ew", **pad)
+        ttk.Button(form, text="Обзор...", command=self._choose_folder).grid(row=3, column=3, **pad)
 
         type_frame = ttk.LabelFrame(form, text="Тип субтитров")
-        type_frame.grid(row=3, column=0, columnspan=4, sticky="ew", **pad)
+        type_frame.grid(row=4, column=0, columnspan=4, sticky="ew", **pad)
         self.type_var = tk.StringVar(value="both")
         for i, (value, label) in enumerate([
             ("both", "Авторские + автоматические"),
@@ -71,7 +85,7 @@ class TubetubeApp:
             )
 
         format_frame = ttk.LabelFrame(form, text="Формат сохранения")
-        format_frame.grid(row=4, column=0, columnspan=4, sticky="ew", **pad)
+        format_frame.grid(row=5, column=0, columnspan=4, sticky="ew", **pad)
         self.format_var = tk.StringVar(value="srt")
         for i, (value, label) in enumerate([
             ("srt", "SRT"),
@@ -85,7 +99,7 @@ class TubetubeApp:
         self.keep_vtt_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             form, text="Не удалять промежуточный .vtt", variable=self.keep_vtt_var
-        ).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+        ).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
 
         buttons = ttk.Frame(self.root)
         buttons.pack(fill="x", **pad)
@@ -180,6 +194,7 @@ class TubetubeApp:
         state = "disabled" if busy else "normal"
         self.langs_button.configure(state=state)
         self.download_button.configure(state=state)
+        self.preview_button.configure(state=state)
         self.update_button.configure(state=state)
         self.git_pull_button.configure(
             state=state if (not busy and self._git_pull_available) else "disabled"
@@ -224,6 +239,44 @@ class TubetubeApp:
             return ["all"]
         return [lang.strip() for lang in raw.split(",") if lang.strip()] or ["ru", "en"]
 
+    def _on_preview_playlist(self) -> None:
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning(APP_TITLE, "Укажите ссылку на видео или плейлист.")
+            return
+        title_filter = self.title_filter_var.get().strip() or None
+
+        def task(cancel_event):
+            self._post(lambda: self._set_busy(True, "Предпросмотр плейлиста...", cancellable=True))
+            final_status = "Готово"
+            try:
+                pattern = compile_title_filter(title_filter) if title_filter else None
+                is_playlist, entries = list_playlist_entries(url, on_log=self._log, cancel_event=cancel_event)
+                self._log("")
+                self._log(f"{'Плейлист' if is_playlist else 'Видео'}: {len(entries)} видео")
+                matched = 0
+                for entry in entries:
+                    title = entry["title"]
+                    if pattern is not None:
+                        ok = bool(pattern.search(title))
+                        matched += ok
+                        self._log(f"  {'[+]' if ok else '[ ]'} {entry['index']:>3}. {title}")
+                    else:
+                        self._log(f"      {entry['index']:>3}. {title}")
+                if pattern is not None:
+                    self._log(f"\nПодходит под фильтр '{title_filter}': {matched} из {len(entries)}")
+            except OperationCancelled as exc:
+                self._log(f"Отменено: {exc}")
+                final_status = "Отменено"
+            except DownloadError as exc:
+                self._log(f"Ошибка: {exc}")
+                self._post(lambda exc=exc: messagebox.showerror(APP_TITLE, str(exc)))
+                final_status = "Ошибка"
+            finally:
+                self._post(lambda s=final_status: self._set_busy(False, s))
+
+        self._run_cancellable_in_thread(task)
+
     def _on_list_langs(self) -> None:
         url = self.url_var.get().strip()
         if not url:
@@ -260,6 +313,7 @@ class TubetubeApp:
         sub_type = self.type_var.get()
         fmt = self.format_var.get()
         keep_vtt = self.keep_vtt_var.get()
+        title_filter = self.title_filter_var.get().strip() or None
 
         def task(cancel_event):
             self._post(lambda: self._set_busy(True, "Скачивание субтитров...", cancellable=True))
@@ -275,6 +329,7 @@ class TubetubeApp:
                     keep_vtt=keep_vtt,
                     on_log=self._log,
                     cancel_event=cancel_event,
+                    title_filter=title_filter,
                 )
                 self._log("")
                 self._log(f"Готово. Сохранено файлов: {len(results)}")

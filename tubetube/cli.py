@@ -5,7 +5,13 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .downloader import DownloadError, download_subtitles, list_available_languages
+from .downloader import (
+    DownloadError,
+    compile_title_filter,
+    download_subtitles,
+    list_available_languages,
+    list_playlist_entries,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +64,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Показать доступные языки субтитров для видео и выйти (для плейлиста — по первому видео)",
     )
     parser.add_argument(
+        "-T", "--title-filter",
+        default=None,
+        metavar="REGEX",
+        help=(
+            "Скачивать субтитры только тех видео плейлиста, чьё название подходит "
+            "под это регулярное выражение (без учёта регистра). Например: "
+            "'^1\\.' — только раздел 1.x, 'Domain 1' — по слову в названии. "
+            "Подберите паттерн через --list-titles."
+        ),
+    )
+    parser.add_argument(
+        "--list-titles",
+        action="store_true",
+        help=(
+            "Показать список видео плейлиста (индекс + название) и выйти, ничего не скачивая. "
+            "Вместе с --title-filter отмечает, какие видео под него подходят — удобно для подбора паттерна."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Подробный вывод yt-dlp",
@@ -81,6 +106,25 @@ def _print_languages(url: str) -> None:
         print("  (нет)")
 
 
+def _print_titles(url: str, title_filter: str | None) -> None:
+    pattern = compile_title_filter(title_filter) if title_filter else None
+    is_playlist, entries = list_playlist_entries(url)
+    kind = "Плейлист" if is_playlist else "Видео"
+    print(f"{kind}: {len(entries)} видео")
+    matched_count = 0
+    for entry in entries:
+        title = entry["title"]
+        if pattern is not None:
+            matched = bool(pattern.search(title))
+            matched_count += matched
+            mark = "[+]" if matched else "[ ]"
+            print(f"  {mark} {entry['index']:>3}. {title}")
+        else:
+            print(f"  {entry['index']:>3}. {title}")
+    if pattern is not None:
+        print(f"\nПодходит под фильтр '{title_filter}': {matched_count} из {len(entries)}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -97,6 +141,10 @@ def main(argv: list[str] | None = None) -> int:
             _print_languages(args.url)
             return 0
 
+        if args.list_titles:
+            _print_titles(args.url, args.title_filter)
+            return 0
+
         langs = ["all"] if args.langs.strip().lower() == "all" else [
             lang.strip() for lang in args.langs.split(",") if lang.strip()
         ]
@@ -109,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
             fmt=args.format,
             keep_vtt=args.keep_vtt,
             verbose=args.verbose,
+            title_filter=args.title_filter,
+            on_log=print if args.title_filter else None,
         )
 
         print(f"\nГотово. Сохранено файлов субтитров: {len(results)}")

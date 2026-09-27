@@ -9,6 +9,7 @@ YouTube без дополнительных преобразований), а к
 from __future__ import annotations
 
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -35,13 +36,33 @@ def _check_cancelled(cancel_event: Optional[CancelEvent]) -> None:
         raise OperationCancelled("Отменено пользователем")
 
 
-def _make_cancel_filter(cancel_event: Optional[CancelEvent]):
-    """match_filter для yt-dlp: позволяет прервать обработку плейлиста
-    между видео, если пользователь нажал «Отмена»."""
+def compile_title_filter(pattern: str) -> "re.Pattern[str]":
+    """Компилирует пользовательский regex-фильтр по названию видео
+    (без учёта регистра). Бросает DownloadError при некорректном regex."""
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        raise DownloadError(f"Некорректное регулярное выражение фильтра: {exc}") from exc
+
+
+def _make_match_filter(
+    cancel_event: Optional[CancelEvent],
+    title_pattern: "Optional[re.Pattern[str]]" = None,
+):
+    """match_filter для yt-dlp: совмещает два назначения —
+    1) позволяет прервать обработку плейлиста между видео, если
+       пользователь нажал «Отмена»;
+    2) если задан title_pattern, пропускает (не скачивает) видео,
+       чьё название под него не подходит — это и есть фильтр по
+       названию/разделу плейлиста (например, "только Домен 1.0")."""
 
     def _filter(info_dict, *, incomplete=False):
         if cancel_event is not None and cancel_event.is_set():
             raise yt_dlp.utils.DownloadCancelled("Отменено пользователем")
+        if title_pattern is not None:
+            title = info_dict.get("title") or ""
+            if not title_pattern.search(title):
+                return f"название не подходит под фильтр: {title!r}"
         return None
 
     return _filter
@@ -88,7 +109,7 @@ def probe(
     opts = {
         "skip_download": True,
         "extract_flat": False,
-        "match_filter": _make_cancel_filter(cancel_event),
+        "match_filter": _make_match_filter(cancel_event),
     }
     _apply_logging_opts(opts, on_log, verbose=False)
     try:
@@ -120,11 +141,14 @@ def list_available_languages(
     return manual, auto
 
 
-def _is_playlist(
+def _get_flat_info(
     url: str,
     on_log: Optional[LogCallback] = None,
     cancel_event: Optional[CancelEvent] = None,
-) -> bool:
+) -> dict:
+    """Быстрый листинг ссылки (extract_flat) — без полного разбора
+    каждого видео. Используется и для определения "это плейлист?",
+    и для превью названий видео (см. list_playlist_entries)."""
     _check_cancelled(cancel_event)
     opts = {"extract_flat": True, "skip_download": True}
     _apply_logging_opts(opts, on_log, verbose=False)
@@ -134,7 +158,36 @@ def _is_playlist(
     except yt_dlp.utils.DownloadError as exc:
         raise DownloadError(f"Не удалось обработать ссылку: {exc}") from exc
     _check_cancelled(cancel_event)
+    return info or {}
+
+
+def _is_playlist_info(info: dict) -> bool:
     return bool(info) and "entries" in info
+
+
+def _entry_titles(info: dict) -> list[dict]:
+    """[{'index': 1, 'title': ..., 'id': ...}, ...] — для плейлиста все
+    видео по порядку, для одиночного видео список из одной записи."""
+    if _is_playlist_info(info):
+        entries = [e for e in info["entries"] if e]
+        return [
+            {"index": i, "title": e.get("title") or e.get("id") or "?", "id": e.get("id")}
+            for i, e in enumerate(entries, start=1)
+        ]
+    return [{"index": 1, "title": info.get("title") or info.get("id") or "?", "id": info.get("id")}]
+
+
+def list_playlist_entries(
+    url: str,
+    on_log: Optional[LogCallback] = None,
+    cancel_event: Optional[CancelEvent] = None,
+) -> tuple[bool, list[dict]]:
+    """Превью плейлиста/видео без скачивания: возвращает (is_playlist,
+    список {"index", "title", "id"}). Дёшево — использует extract_flat,
+    не разбирает субтитры каждого видео. Полезно, чтобы подобрать
+    --title-filter перед скачиванием."""
+    info = _get_flat_info(url, on_log=on_log, cancel_event=cancel_event)
+    return _is_playlist_info(info), _entry_titles(info)
 
 
 def _collect_subtitle_filepaths(info: dict | None) -> set[Path]:
@@ -164,6 +217,7 @@ def download_subtitles(
     verbose: bool = False,
     on_log: Optional[LogCallback] = None,
     cancel_event: Optional[CancelEvent] = None,
+    title_filter: Optional[str] = None,
 ) -> list[Path]:
     """Скачивает субтитры и конвертирует их в нужный формат.
 
@@ -174,11 +228,30 @@ def download_subtitles(
         и бросает OperationCancelled при первой безопасной возможности —
         между видео плейлиста или между конвертацией отдельных файлов.
         Уже скачанные к этому моменту файлы с диска не удаляются.
+    title_filter: необязательный regex (без учёта регистра). Если задан,
+        в плейлисте скачиваются субтитры только тех видео, чьё название
+        ему соответствует — например, только раздел "Домен 1.0" курса.
+        Для одиночного видео фильтр применяется к его названию так же.
     Возвращает список путей к итоговым файлам субтитров.
     """
     _check_cancelled(cancel_event)
     langs = list(langs)
-    is_playlist = _is_playlist(url, on_log=on_log, cancel_event=cancel_event)
+    title_pattern = compile_title_filter(title_filter) if title_filter else None
+
+    flat_info = _get_flat_info(url, on_log=on_log, cancel_event=cancel_event)
+    is_playlist = _is_playlist_info(flat_info)
+
+    if title_pattern is not None:
+        entries = _entry_titles(flat_info)
+        matched = [e for e in entries if title_pattern.search(e["title"])]
+        if on_log is not None:
+            on_log(f"Фильтр по названию '{title_filter}': подходит {len(matched)} из {len(entries)} видео.")
+        if not matched:
+            raise DownloadError(
+                f"Ни одно видео не подошло под фильтр названия '{title_filter}'. "
+                "Проверьте регулярное выражение или посмотрите список видео (--list-titles)."
+            )
+
     out_base = Path(output_dir)
     out_base.mkdir(parents=True, exist_ok=True)
 
@@ -196,7 +269,7 @@ def download_subtitles(
         "outtmpl": outtmpl,
         "ignoreerrors": True,
         "restrictfilenames": False,
-        "match_filter": _make_cancel_filter(cancel_event),
+        "match_filter": _make_match_filter(cancel_event, title_pattern),
     }
     _apply_logging_opts(ydl_opts, on_log, verbose=verbose)
     if on_log is not None:

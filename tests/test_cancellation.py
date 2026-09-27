@@ -6,7 +6,7 @@ import yt_dlp.utils as ydl_utils
 from tubetube.downloader import (
     OperationCancelled,
     _check_cancelled,
-    _make_cancel_filter,
+    _make_match_filter,
     download_subtitles,
     list_available_languages,
 )
@@ -26,14 +26,14 @@ class TestCancellation(unittest.TestCase):
 
     def test_match_filter_raises_download_cancelled_when_set(self):
         ev = threading.Event()
-        f = _make_cancel_filter(ev)
+        f = _make_match_filter(ev)
         self.assertIsNone(f({"id": "x"}))  # пока не отменено — пропускает видео
         ev.set()
         with self.assertRaises(ydl_utils.DownloadCancelled):
             f({"id": "x"})
 
     def test_match_filter_with_no_event_never_cancels(self):
-        f = _make_cancel_filter(None)
+        f = _make_match_filter(None)
         self.assertIsNone(f({"id": "x"}))
 
     def test_download_subtitles_bails_immediately_if_pre_cancelled(self):
