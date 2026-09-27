@@ -10,6 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .downloader import DownloadError, download_subtitles, list_available_languages
+from .updater import UpdateError, current_version, update_yt_dlp
 
 APP_TITLE = "tubetube — субтитры YouTube"
 
@@ -86,6 +87,13 @@ class TubetubeApp:
         self.download_button.pack(side="left", padx=4)
         self.open_folder_button = ttk.Button(buttons, text="Открыть папку", command=self._open_output_folder)
         self.open_folder_button.pack(side="left", padx=4)
+        self.update_button = ttk.Button(
+            buttons, text="Обновить yt-dlp", command=self._on_update_yt_dlp
+        )
+        self.update_button.pack(side="left", padx=4)
+
+        self.version_var = tk.StringVar(value=f"yt-dlp: {current_version()}")
+        ttk.Label(buttons, textvariable=self.version_var, anchor="e").pack(side="right", padx=4)
 
         self.progress = ttk.Progressbar(self.root, mode="indeterminate")
         self.progress.pack(fill="x", padx=8, pady=(0, 4))
@@ -138,6 +146,7 @@ class TubetubeApp:
         state = "disabled" if busy else "normal"
         self.langs_button.configure(state=state)
         self.download_button.configure(state=state)
+        self.update_button.configure(state=state)
         self.status_var.set(status)
         if busy:
             self.progress.start(12)
@@ -214,6 +223,21 @@ class TubetubeApp:
                 )
             except DownloadError as exc:
                 self._log(f"Ошибка: {exc}")
+                self.root.after(0, lambda: messagebox.showerror(APP_TITLE, str(exc)))
+            finally:
+                self.root.after(0, lambda: self._set_busy(False, "Готово"))
+
+        self._run_in_thread(task)
+
+    def _on_update_yt_dlp(self) -> None:
+        def task():
+            self.root.after(0, lambda: self._set_busy(True, "Обновление yt-dlp..."))
+            try:
+                result = update_yt_dlp(on_log=self._log)
+                self.root.after(0, lambda: self.version_var.set(f"yt-dlp: {current_version()} (см. лог)"))
+                self.root.after(0, lambda: messagebox.showinfo(APP_TITLE, result))
+            except UpdateError as exc:
+                self._log(f"Ошибка обновления: {exc}")
                 self.root.after(0, lambda: messagebox.showerror(APP_TITLE, str(exc)))
             finally:
                 self.root.after(0, lambda: self._set_busy(False, "Готово"))
