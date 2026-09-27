@@ -6,6 +6,7 @@ from __future__ import annotations
 import queue
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Callable
@@ -130,6 +131,10 @@ class TubetubeApp:
             buttons, text="Копировать пути", command=self._on_copy_paths, state="disabled"
         )
         self.copy_paths_button.pack(side="left", padx=4)
+        self.export_log_button = ttk.Button(
+            buttons, text="Экспорт лога...", command=self._on_export_log
+        )
+        self.export_log_button.pack(side="left", padx=4)
         self.update_button = ttk.Button(
             buttons, text="Обновить yt-dlp", command=self._on_update_yt_dlp
         )
@@ -236,6 +241,35 @@ class TubetubeApp:
         self.root.clipboard_append(text)
         self.root.update()
         self.status_var.set(f"Скопировано путей в буфер обмена: {len(self._last_results)}")
+
+    def _on_export_log(self) -> None:
+        text = self.log_widget.get("1.0", "end")
+        if not text.strip():
+            messagebox.showinfo(APP_TITLE, "Лог пуст — экспортировать нечего.")
+            return
+
+        default_dir = self.output_var.get().strip() or str(Path.cwd())
+        Path(default_dir).mkdir(parents=True, exist_ok=True)
+        default_name = f"tubetube-log-{datetime.now():%Y%m%d-%H%M%S}.txt"
+
+        path = filedialog.asksaveasfilename(
+            title="Экспорт лога",
+            initialdir=default_dir,
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+
+        try:
+            Path(path).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"Не удалось сохранить лог: {exc}")
+            return
+
+        self.status_var.set(f"Лог сохранён: {path}")
+        self._log(f"Лог экспортирован в файл: {path}")
 
     def _log(self, message: str) -> None:
         self._log_queue.put(message)
