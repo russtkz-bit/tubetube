@@ -148,10 +148,68 @@ class TestPartialDownloadWarning(unittest.TestCase):
         results, logs = self._run_with_fake_ydl(info, keep_vtt=False)
 
         self.assertEqual(len(results), 2)
+        retry_line = next((line for line in logs if "повторная попытка" in line), None)
+        self.assertIsNotNone(retry_line, f"Не было автоматической повторной попытки. Лог: {logs}")
+        self.assertIn("индексы: 3", retry_line)  # видео 'c' — третье по счёту (индекс 3)
         warning = next((line for line in logs if line.startswith("Внимание:")), None)
         self.assertIsNotNone(warning, f"Не найдено предупреждение о нехватке файлов. Лог: {logs}")
         self.assertIn("2 файл(ов) из 3", warning)
         self.assertIn("--keep-vtt", warning)  # т.к. keep_vtt=False — совет его включить
+
+    def test_retry_recovers_missing_file(self):
+        """Первый проход недосчитался одного видео (как при HTTP 429),
+        но автоматическая повторная попытка (playlist_items) его
+        находит — в этом случае итоговый результат полный, и
+        предупреждения быть не должно."""
+        p1 = self._write_fake_vtt("001 - 1.1 A.en.vtt")
+        p2 = self._write_fake_vtt("002 - 1.2 B.en.vtt")
+        p3 = self._write_fake_vtt("003 - 1.3 C.en.vtt")
+
+        first_pass = {
+            "entries": [
+                {"requested_subtitles": {"en": {"filepath": p1}}},
+                {"requested_subtitles": {"en": {"filepath": p2}}},
+            ]
+        }
+        retry_pass = {"requested_subtitles": {"en": {"filepath": p3}}}
+
+        captured_opts = []
+
+        class StatefulFakeYDL:
+            call_count = 0
+
+            def __init__(self, opts):
+                captured_opts.append(opts)
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=True):
+                StatefulFakeYDL.call_count += 1
+                return first_pass if StatefulFakeYDL.call_count == 1 else retry_pass
+
+        logs = []
+        with mock.patch.object(yt_dlp, "YoutubeDL", StatefulFakeYDL):
+            results = download_subtitles(
+                "https://example.com/playlist",
+                self.tmpdir,
+                ["en"],
+                title_filter=r"^1\.",
+                on_log=logs.append,
+                keep_vtt=False,
+            )
+
+        self.assertEqual(StatefulFakeYDL.call_count, 2)
+        self.assertEqual(len(results), 3)
+        self.assertEqual(captured_opts[1]["playlist_items"], "3")
+        warning = next((line for line in logs if line.startswith("Внимание:")), None)
+        self.assertIsNone(warning, f"После успешной повторной попытки предупреждения быть не должно. Лог: {logs}")
+        success_line = next((line for line in logs if "скачано ещё 1 файл" in line), None)
+        self.assertIsNotNone(success_line, f"Не было сообщения об успехе повторной попытки. Лог: {logs}")
 
     def test_no_warning_when_all_matched_files_present(self):
         p1 = self._write_fake_vtt("001 - 1.1 A.en.vtt")

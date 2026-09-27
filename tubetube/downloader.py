@@ -239,6 +239,66 @@ def _collect_subtitle_filepaths(info: dict | None) -> set[Path]:
     return paths
 
 
+_LEADING_INDEX_RE = re.compile(r"^(\d+) - ")
+
+
+def _parse_leading_index(path: Path) -> Optional[int]:
+    """Достаёт %(playlist_index)03d из начала имени файла (наш outtmpl
+    для плейлистов всегда кладёт его первым), чтобы понять, для каких
+    видео плейлиста субтитры реально скачались."""
+    m = _LEADING_INDEX_RE.match(path.name)
+    return int(m.group(1)) if m else None
+
+
+def _retry_missing_matched_entries(
+    ydl_opts: dict,
+    url: str,
+    matched: list[dict],
+    written_vtt_files: list[Path],
+    on_log: Optional[LogCallback],
+    cancel_event: Optional[CancelEvent],
+) -> list[Path]:
+    """Одна повторная попытка докачать субтитры для видео, которые
+    должны были подойти под --title-filter, но не скачались с первого
+    раза (обычно из-за временного HTTP 429 Too Many Requests от
+    YouTube). Использует playlist_items, чтобы yt-dlp заново обработал
+    только недостающие индексы — быстро, с тем же именованием файлов и
+    той же папкой, что и в основном проходе (не нужно самим повторять
+    логику формирования имён)."""
+    succeeded_indices = {i for p in written_vtt_files if (i := _parse_leading_index(p)) is not None}
+    matched_indices = {e["index"] for e in matched}
+    missing_indices = sorted(matched_indices - succeeded_indices)
+    if not missing_indices:
+        return written_vtt_files
+
+    _check_cancelled(cancel_event)
+    if on_log is not None:
+        on_log(
+            f"Не хватает {len(missing_indices)} файл(ов) после первого прохода "
+            f"(индексы: {', '.join(str(i) for i in missing_indices)}) — повторная попытка..."
+        )
+
+    retry_opts = dict(ydl_opts)
+    retry_opts["playlist_items"] = ",".join(str(i) for i in missing_indices)
+
+    try:
+        with yt_dlp.YoutubeDL(retry_opts) as ydl:
+            retry_info = ydl.extract_info(url, download=True)
+    except yt_dlp.utils.DownloadCancelled as exc:
+        raise OperationCancelled(str(exc)) from exc
+    except yt_dlp.utils.DownloadError as exc:
+        if on_log is not None:
+            on_log(f"Повторная попытка не удалась: {exc}")
+        return written_vtt_files
+
+    new_files = _collect_subtitle_filepaths(retry_info)
+    combined = sorted(set(written_vtt_files) | new_files)
+    if on_log is not None:
+        gained = len(combined) - len(written_vtt_files)
+        on_log(f"После повторной попытки скачано ещё {gained} файл(ов).")
+    return combined
+
+
 def download_subtitles(
     url: str,
     output_dir: str,
@@ -274,6 +334,7 @@ def download_subtitles(
     is_playlist = _is_playlist_info(flat_info)
 
     expected_count: Optional[int] = None
+    matched: list[dict] = []
     if title_pattern is not None:
         entries = _entry_titles(flat_info)
         matched = [e for e in entries if title_pattern.search(e["title"])]
@@ -305,11 +366,17 @@ def download_subtitles(
         "restrictfilenames": False,
         "match_filter": _make_match_filter(cancel_event, title_pattern),
         "extractor_args": _YOUTUBE_EXTRACTOR_ARGS,
-        # Небольшая пауза перед каждым запросом субтитров — без неё на
-        # больших плейлистах (сотни видео подряд без перерыва) YouTube
-        # иногда отвечает "429 Too Many Requests" на отдельные видео, и
-        # их субтитры молча пропускаются.
-        "sleep_interval_subtitles": 1,
+        # Паузы перед сетевыми запросами — без них на больших плейлистах
+        # (сотни видео подряд без перерыва) YouTube иногда отвечает "429
+        # Too Many Requests" на отдельные видео, и их субтитры молча
+        # пропускаются. sleep_interval_subtitles — конкретно перед каждым
+        # запросом файла субтитров; sleep_interval_requests — между
+        # остальными запросами к YouTube (страница видео, player API и
+        # т.д.), которые тоже вносят вклад в общую частоту запросов.
+        # Проверено на реальном плейлисте из 121 видео: 1 секунды
+        # оказалось недостаточно, поэтому пауза увеличена.
+        "sleep_interval_subtitles": 2,
+        "sleep_interval_requests": 1,
     }
     _apply_logging_opts(ydl_opts, on_log, verbose=verbose)
     if on_log is not None:
@@ -331,6 +398,11 @@ def download_subtitles(
 
     written_vtt_files = sorted(_collect_subtitle_filepaths(info))
 
+    if expected_count is not None and len(written_vtt_files) < expected_count:
+        written_vtt_files = _retry_missing_matched_entries(
+            ydl_opts, url, matched, written_vtt_files, on_log, cancel_event
+        )
+
     if not written_vtt_files:
         raise DownloadError(
             "Субтитры не найдены. Попробуйте --type auto (автоматические субтитры) "
@@ -346,10 +418,11 @@ def download_subtitles(
             " Уже скачанные .vtt на диске — при повторном запуске они не будут запрошены заново."
         )
         on_log(
-            f"Внимание: скачано {len(written_vtt_files)} файл(ов) из {expected_count} ожидаемых "
-            f"по фильтру (не хватает {missing}). Причина обычно видна выше в логе — например, "
-            "временная ошибка сети/YouTube (HTTP 429 Too Many Requests) на конкретном видео, "
-            f"а не отсутствие субтитров. Попробуйте запустить скачивание ещё раз с тем же фильтром.{tip}"
+            f"Внимание: даже после повторной попытки скачано {len(written_vtt_files)} файл(ов) из "
+            f"{expected_count} ожидаемых по фильтру (не хватает {missing}). Причина обычно видна "
+            "выше в логе — например, устойчивая временная ошибка сети/YouTube (HTTP 429 Too Many "
+            f"Requests) на конкретном видео, а не отсутствие субтитров. Попробуйте запустить "
+            f"скачивание ещё раз с тем же фильтром.{tip}"
         )
 
     if cancel_event is not None and cancel_event.is_set():
