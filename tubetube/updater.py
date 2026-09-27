@@ -1,8 +1,9 @@
-"""Обновление библиотеки yt-dlp через pip.
+"""Обновление yt-dlp (через pip) и самого кода tubetube (через git pull).
 
 YouTube нередко меняет сайт, и именно yt-dlp обычно быстро выпускает
-исправление — поэтому саму программу tubetube обновлять не обязательно,
-а вот yt-dlp полезно подтягивать свежим.
+исправление — эту библиотеку стоит обновлять чаще всего. Код самого
+tubetube тоже можно подтянуть из репозитория (git pull), если он
+запущен из исходников (не из собранного .exe).
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from pathlib import Path
 from typing import Callable, Optional
 
 import yt_dlp
@@ -87,3 +89,70 @@ def update_yt_dlp(on_log: Optional[LogCallback] = None) -> str:
     if on_log:
         on_log(f"yt-dlp уже последней версии: {before}")
     return f"yt-dlp уже последней версии ({before})."
+
+
+def _project_root() -> Path:
+    """Корень репозитория tubetube (папка на уровень выше пакета)."""
+    return Path(__file__).resolve().parent.parent
+
+
+def is_git_checkout() -> bool:
+    """True, если программа запущена из git-репозитория, а не из
+    собранного .exe (там исходников и .git нет)."""
+    return not is_frozen() and (_project_root() / ".git").is_dir()
+
+
+def git_pull(on_log: Optional[LogCallback] = None) -> str:
+    """Подтягивает последние изменения кода tubetube из git-репозитория
+    (git pull --ff-only, без слияний и без потери локальных изменений).
+
+    Возвращает текстовое описание результата. Бросает UpdateError, если
+    обновление невозможно или завершилось ошибкой.
+    """
+    if is_frozen():
+        raise UpdateError(
+            "Это собранный .exe — в нём нет исходников и git, поэтому обновить "
+            "код tubetube изнутри программы нельзя. Обновите исходники на "
+            "компьютере с git (git pull) и пересоберите .exe через "
+            "build.bat/build.sh, либо запускайте tubetube из исходников "
+            "(run-gui.bat/run-gui.sh) — там кнопка обновления работает."
+        )
+
+    root = _project_root()
+    if not (root / ".git").is_dir():
+        raise UpdateError(
+            f"Папка {root} не является git-репозиторием — обновление кода невозможно."
+        )
+
+    if on_log:
+        on_log(f"Каталог проекта: {root}")
+        on_log("Выполняю git pull --ff-only...")
+
+    cmd = ["git", "pull", "--ff-only"]
+    try:
+        proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise UpdateError(f"Не удалось запустить git: {exc}") from exc
+
+    if on_log:
+        for line in (proc.stdout or "").splitlines():
+            on_log(line)
+        for line in (proc.stderr or "").splitlines():
+            on_log(line)
+
+    if proc.returncode != 0:
+        raise UpdateError(
+            f"git pull завершился с ошибкой (код {proc.returncode}). Смотрите лог выше — "
+            "возможно, есть несохранённые локальные изменения или ветка разошлась с сервером."
+        )
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if "Already up to date" in output or "Already up-to-date" in output:
+        if on_log:
+            on_log("Код tubetube уже последней версии.")
+        return "Код tubetube уже последней версии."
+
+    if on_log:
+        on_log("Код tubetube обновлён.")
+        on_log("Перезапустите программу, чтобы изменения применились.")
+    return "Код tubetube обновлён. Перезапустите программу, чтобы изменения применились."
