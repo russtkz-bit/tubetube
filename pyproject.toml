@@ -12,8 +12,14 @@ dependencies = [
     "yt-dlp>=2024.1.1",
 ]
 
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
+
 [project.scripts]
 tubetube = "tubetube.cli:main"
+
+[project.gui-scripts]
+tubetube-gui = "tubetube.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["tubetube*"]

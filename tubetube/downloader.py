@@ -10,26 +10,58 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Optional
 
 import yt_dlp
 import yt_dlp.utils
 
 from .converter import vtt_to_srt, vtt_to_text
 
+LogCallback = Callable[[str], None]
+
 
 class DownloadError(RuntimeError):
     pass
 
 
-def probe(url: str) -> dict:
+class _YdlLogger:
+    """Перенаправляет вывод yt-dlp в переданный колбэк (для GUI)."""
+
+    def __init__(self, on_log: LogCallback):
+        self._on_log = on_log
+
+    def debug(self, msg: str) -> None:
+        if msg.startswith("[debug] "):
+            return
+        self._on_log(msg)
+
+    def info(self, msg: str) -> None:
+        self._on_log(msg)
+
+    def warning(self, msg: str) -> None:
+        self._on_log(f"Предупреждение: {msg}")
+
+    def error(self, msg: str) -> None:
+        self._on_log(f"Ошибка: {msg}")
+
+
+def _apply_logging_opts(opts: dict, on_log: Optional[LogCallback], verbose: bool) -> None:
+    if on_log is not None:
+        opts["logger"] = _YdlLogger(on_log)
+        opts["quiet"] = True
+        opts["no_warnings"] = True
+    else:
+        opts["quiet"] = not verbose
+        opts["no_warnings"] = not verbose
+
+
+def probe(url: str, on_log: Optional[LogCallback] = None) -> dict:
     """Возвращает информацию о ссылке без скачивания (для --list-langs)."""
     opts = {
-        "quiet": True,
-        "no_warnings": True,
         "skip_download": True,
         "extract_flat": False,
     }
+    _apply_logging_opts(opts, on_log, verbose=False)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -45,15 +77,18 @@ def probe(url: str) -> dict:
     return info
 
 
-def list_available_languages(url: str) -> tuple[dict, dict]:
-    info = probe(url)
+def list_available_languages(
+    url: str, on_log: Optional[LogCallback] = None
+) -> tuple[dict, dict]:
+    info = probe(url, on_log=on_log)
     manual = info.get("subtitles") or {}
     auto = info.get("automatic_captions") or {}
     return manual, auto
 
 
-def _is_playlist(url: str) -> bool:
-    opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "skip_download": True}
+def _is_playlist(url: str, on_log: Optional[LogCallback] = None) -> bool:
+    opts = {"extract_flat": True, "skip_download": True}
+    _apply_logging_opts(opts, on_log, verbose=False)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -87,15 +122,17 @@ def download_subtitles(
     fmt: str = "srt",
     keep_vtt: bool = False,
     verbose: bool = False,
+    on_log: Optional[LogCallback] = None,
 ) -> list[Path]:
     """Скачивает субтитры и конвертирует их в нужный формат.
 
     sub_type: "manual", "auto" или "both"
     fmt: "vtt", "srt" или "txt"
+    on_log: необязательный колбэк для вывода хода работы (используется GUI)
     Возвращает список путей к итоговым файлам субтитров.
     """
     langs = list(langs)
-    is_playlist = _is_playlist(url)
+    is_playlist = _is_playlist(url, on_log=on_log)
     out_base = Path(output_dir)
     out_base.mkdir(parents=True, exist_ok=True)
 
@@ -112,10 +149,15 @@ def download_subtitles(
         "subtitlesformat": "vtt",
         "outtmpl": outtmpl,
         "ignoreerrors": True,
-        "quiet": not verbose,
-        "no_warnings": not verbose,
         "restrictfilenames": False,
     }
+    _apply_logging_opts(ydl_opts, on_log, verbose=verbose)
+    if on_log is not None:
+        ydl_opts["progress_hooks"] = [
+            lambda d: on_log(f"Скачивание: {Path(d['filename']).name}")
+            if d.get("status") == "finished" and "filename" in d
+            else None
+        ]
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -133,6 +175,9 @@ def download_subtitles(
 
     if fmt == "vtt":
         return written_vtt_files
+
+    if on_log is not None:
+        on_log(f"Конвертация {len(written_vtt_files)} файл(ов) в формат {fmt}...")
 
     results: list[Path] = []
     for vtt_path in written_vtt_files:

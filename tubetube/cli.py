@@ -16,7 +16,15 @@ def build_parser() -> argparse.ArgumentParser:
             "и сохраняет их в формате SRT, VTT или обычного текста."
         ),
     )
-    parser.add_argument("url", help="Ссылка на видео или плейлист YouTube")
+    parser.add_argument(
+        "url", nargs="?", default=None,
+        help="Ссылка на видео или плейлист YouTube (не нужна с --gui)",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Запустить графический интерфейс вместо командной строки",
+    )
     parser.add_argument(
         "-l", "--langs",
         default="ru,en",
@@ -76,6 +84,13 @@ def _print_languages(url: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.gui:
+        from .gui import main as gui_main
+        return gui_main()
+
+    if not args.url:
+        parser.error("укажите ссылку (url) или используйте --gui")
 
     try:
         if args.list_langs:
