@@ -273,9 +273,11 @@ def download_subtitles(
     flat_info = _get_flat_info(url, on_log=on_log, cancel_event=cancel_event)
     is_playlist = _is_playlist_info(flat_info)
 
+    expected_count: Optional[int] = None
     if title_pattern is not None:
         entries = _entry_titles(flat_info)
         matched = [e for e in entries if title_pattern.search(e["title"])]
+        expected_count = len(matched)
         if on_log is not None:
             on_log(f"Фильтр по названию '{title_filter}': подходит {len(matched)} из {len(entries)} видео.")
         if not matched:
@@ -303,6 +305,11 @@ def download_subtitles(
         "restrictfilenames": False,
         "match_filter": _make_match_filter(cancel_event, title_pattern),
         "extractor_args": _YOUTUBE_EXTRACTOR_ARGS,
+        # Небольшая пауза перед каждым запросом субтитров — без неё на
+        # больших плейлистах (сотни видео подряд без перерыва) YouTube
+        # иногда отвечает "429 Too Many Requests" на отдельные видео, и
+        # их субтитры молча пропускаются.
+        "sleep_interval_subtitles": 1,
     }
     _apply_logging_opts(ydl_opts, on_log, verbose=verbose)
     if on_log is not None:
@@ -328,6 +335,21 @@ def download_subtitles(
         raise DownloadError(
             "Субтитры не найдены. Попробуйте --type auto (автоматические субтитры) "
             "или проверьте доступные языки через --list-langs."
+        )
+
+    if expected_count is not None and len(written_vtt_files) < expected_count and on_log is not None:
+        missing = expected_count - len(written_vtt_files)
+        tip = (
+            " Совет: включите «Не удалять промежуточный .vtt» (--keep-vtt) — тогда при повторном "
+            "запуске уже скачанные видео не будут запрашиваться у YouTube заново, докачаются "
+            "только недостающие." if not keep_vtt else
+            " Уже скачанные .vtt на диске — при повторном запуске они не будут запрошены заново."
+        )
+        on_log(
+            f"Внимание: скачано {len(written_vtt_files)} файл(ов) из {expected_count} ожидаемых "
+            f"по фильтру (не хватает {missing}). Причина обычно видна выше в логе — например, "
+            "временная ошибка сети/YouTube (HTTP 429 Too Many Requests) на конкретном видео, "
+            f"а не отсутствие субтитров. Попробуйте запустить скачивание ещё раз с тем же фильтром.{tip}"
         )
 
     if cancel_event is not None and cancel_event.is_set():

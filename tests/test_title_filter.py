@@ -1,11 +1,19 @@
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
+import yt_dlp
+
+import tubetube.downloader as downloader_module
 from tubetube.downloader import (
     DownloadError,
     _entry_titles,
     _is_playlist_info,
     _make_match_filter,
     compile_title_filter,
+    download_subtitles,
 )
 
 PLAYLIST_FLAT_INFO = {
@@ -69,6 +77,98 @@ class TestMatchFilterTitleFiltering(unittest.TestCase):
         self.assertIsNone(f({"playlist": "CompTIA Security+ Training Course"}))
         self.assertIsNone(f({"title": ""}))
         self.assertIsNone(f({}))
+
+
+class TestPartialDownloadWarning(unittest.TestCase):
+    """Регрессия: реальный плейлист (121 видео) — фильтр правильно нашёл
+    18 подходящих, но одно из них не скачалось из-за временного HTTP 429
+    от YouTube. Пользователь должен увидеть явное предупреждение об этом
+    в логе, а не тихо получить на файл меньше без объяснения."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+        def fake_get_flat_info(url, on_log=None, cancel_event=None):
+            return {
+                "entries": [
+                    {"title": "1.1 A", "id": "a"},
+                    {"title": "1.2 B", "id": "b"},
+                    {"title": "1.3 C", "id": "c"},  # эта "упадёт" с 429
+                    {"title": "2.1 D", "id": "d"},  # не подходит под фильтр
+                ]
+            }
+
+        patcher = mock.patch.object(downloader_module, "_get_flat_info", fake_get_flat_info)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_fake_vtt(self, name: str) -> str:
+        path = str(Path(self.tmpdir) / name)
+        Path(path).write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n", encoding="utf-8")
+        return path
+
+    def _run_with_fake_ydl(self, extract_info_result, **kwargs):
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=True):
+                return extract_info_result
+
+        logs = []
+        with mock.patch.object(yt_dlp, "YoutubeDL", FakeYDL):
+            results = download_subtitles(
+                "https://example.com/playlist",
+                self.tmpdir,
+                ["en"],
+                title_filter=r"^1\.",
+                on_log=logs.append,
+                **kwargs,
+            )
+        return results, logs
+
+    def test_warns_when_fewer_files_than_matched(self):
+        p1 = self._write_fake_vtt("001 - 1.1 A.en.vtt")
+        p2 = self._write_fake_vtt("002 - 1.2 B.en.vtt")
+        # видео 'c' (1.3) отсутствует в requested_subtitles — как если бы
+        # yt-dlp получил на него HTTP 429 и пропустил с предупреждением
+        info = {
+            "entries": [
+                {"requested_subtitles": {"en": {"filepath": p1}}},
+                {"requested_subtitles": {"en": {"filepath": p2}}},
+            ]
+        }
+        results, logs = self._run_with_fake_ydl(info, keep_vtt=False)
+
+        self.assertEqual(len(results), 2)
+        warning = next((line for line in logs if line.startswith("Внимание:")), None)
+        self.assertIsNotNone(warning, f"Не найдено предупреждение о нехватке файлов. Лог: {logs}")
+        self.assertIn("2 файл(ов) из 3", warning)
+        self.assertIn("--keep-vtt", warning)  # т.к. keep_vtt=False — совет его включить
+
+    def test_no_warning_when_all_matched_files_present(self):
+        p1 = self._write_fake_vtt("001 - 1.1 A.en.vtt")
+        p2 = self._write_fake_vtt("002 - 1.2 B.en.vtt")
+        p3 = self._write_fake_vtt("003 - 1.3 C.en.vtt")
+        info = {
+            "entries": [
+                {"requested_subtitles": {"en": {"filepath": p1}}},
+                {"requested_subtitles": {"en": {"filepath": p2}}},
+                {"requested_subtitles": {"en": {"filepath": p3}}},
+            ]
+        }
+        results, logs = self._run_with_fake_ydl(info, keep_vtt=False)
+
+        self.assertEqual(len(results), 3)
+        warning = next((line for line in logs if line.startswith("Внимание:")), None)
+        self.assertIsNone(warning, f"Предупреждение не должно появляться, когда всё скачалось. Лог: {logs}")
 
 
 if __name__ == "__main__":
