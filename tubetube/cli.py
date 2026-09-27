@@ -90,8 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _print_languages(url: str) -> None:
-    manual, auto = list_available_languages(url)
+def _print_languages(url: str, verbose: bool = False) -> None:
+    manual, auto = list_available_languages(url, verbose=verbose)
     print("Авторские субтитры (manual):")
     if manual:
         for lang in sorted(manual):
@@ -138,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.list_langs:
-            _print_languages(args.url)
+            _print_languages(args.url, verbose=args.verbose)
             return 0
 
         if args.list_titles:

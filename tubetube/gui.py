@@ -109,6 +109,13 @@ class TubetubeApp:
             form, text="Не удалять промежуточный .vtt", variable=self.keep_vtt_var
         ).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
 
+        self.verbose_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            form,
+            text="Подробный лог (для диагностики, если субтитры не находятся)",
+            variable=self.verbose_var,
+        ).grid(row=6, column=2, columnspan=2, sticky="w", **pad)
+
         buttons = ttk.Frame(self.root)
         buttons.pack(fill="x", **pad)
         self.langs_button = ttk.Button(buttons, text="Показать доступные языки", command=self._on_list_langs)
@@ -357,12 +364,15 @@ class TubetubeApp:
         if not url:
             messagebox.showwarning(APP_TITLE, "Укажите ссылку на видео или плейлист.")
             return
+        verbose = self.verbose_var.get()
 
         def task(cancel_event):
             self._post(lambda: self._set_busy(True, "Получение списка языков...", cancellable=True))
             final_status = "Готово"
             try:
-                manual, auto = list_available_languages(url, on_log=self._log, cancel_event=cancel_event)
+                manual, auto = list_available_languages(
+                    url, on_log=self._log, cancel_event=cancel_event, verbose=verbose
+                )
                 self._log("")
                 self._log("Авторские субтитры (manual): " + (", ".join(sorted(manual)) or "нет"))
                 self._log("Автоматические субтитры (auto): " + (", ".join(sorted(auto)) or "нет"))
@@ -389,6 +399,7 @@ class TubetubeApp:
         fmt = self.format_var.get()
         keep_vtt = self.keep_vtt_var.get()
         title_filter = self.title_filter_var.get().strip() or None
+        verbose = self.verbose_var.get()
 
         def task(cancel_event):
             self._post(lambda: self._set_busy(True, "Скачивание субтитров...", cancellable=True))
@@ -405,6 +416,7 @@ class TubetubeApp:
                     on_log=self._log,
                     cancel_event=cancel_event,
                     title_filter=title_filter,
+                    verbose=verbose,
                 )
                 self._log("")
                 self._log(f"Готово. Сохранено файлов: {len(results)}")

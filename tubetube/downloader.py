@@ -22,6 +22,16 @@ from .converter import vtt_to_srt, vtt_to_text
 LogCallback = Callable[[str], None]
 CancelEvent = threading.Event
 
+# Без установленного JS-рантайма (Deno и т.п.) yt-dlp по умолчанию
+# запрашивает данные о видео только через клиент "visionos" — у него
+# иногда отсутствует информация о доступных субтитрах, и тогда yt-dlp
+# сообщает "there are no subtitles", хотя на самом деле они есть.
+# Добавляем "web" в список клиентов через "default" (не заменяя
+# стандартный набор, а дополняя его) — для получения самого списка
+# субтитров ему JS-рантайм не нужен, только для решения новых
+# анти-бот-испытаний YouTube (PO Token), которые встречаются не всегда.
+_YOUTUBE_EXTRACTOR_ARGS = {"youtube": {"player_client": ["web", "default"]}}
+
 
 class DownloadError(RuntimeError):
     pass
@@ -76,11 +86,16 @@ def _make_match_filter(
 class _YdlLogger:
     """Перенаправляет вывод yt-dlp в переданный колбэк (для GUI)."""
 
-    def __init__(self, on_log: LogCallback):
+    def __init__(self, on_log: LogCallback, verbose: bool = False):
         self._on_log = on_log
+        self._verbose = verbose
 
     def debug(self, msg: str) -> None:
-        if msg.startswith("[debug] "):
+        # В подробном (verbose) режиме debug-сообщения yt-dlp могут
+        # объяснять, почему что-то не скачалось — например, что часть
+        # субтитров пропущена из-за требования PO Token (см. README).
+        # В обычном режиме это в основном шум, поэтому по умолчанию скрыто.
+        if msg.startswith("[debug] ") and not self._verbose:
             return
         self._on_log(msg)
 
@@ -95,8 +110,13 @@ class _YdlLogger:
 
 
 def _apply_logging_opts(opts: dict, on_log: Optional[LogCallback], verbose: bool) -> None:
+    # Раньше verbose учитывался только при on_log=None — из-за этого
+    # yt-dlp никогда не получал params["verbose"]=True при работе с GUI,
+    # и его собственные debug-объяснения (например, про PO Token, из-за
+    # которого могут пропадать субтитры) никогда не доходили до лога.
+    opts["verbose"] = verbose
     if on_log is not None:
-        opts["logger"] = _YdlLogger(on_log)
+        opts["logger"] = _YdlLogger(on_log, verbose=verbose)
         opts["quiet"] = True
         opts["no_warnings"] = True
         # Без этого yt-dlp иногда вставляет ANSI-коды подсветки в сообщения
@@ -112,6 +132,7 @@ def probe(
     url: str,
     on_log: Optional[LogCallback] = None,
     cancel_event: Optional[CancelEvent] = None,
+    verbose: bool = False,
 ) -> dict:
     """Возвращает информацию о ссылке без скачивания (для --list-langs)."""
     _check_cancelled(cancel_event)
@@ -119,8 +140,9 @@ def probe(
         "skip_download": True,
         "extract_flat": False,
         "match_filter": _make_match_filter(cancel_event),
+        "extractor_args": _YOUTUBE_EXTRACTOR_ARGS,
     }
-    _apply_logging_opts(opts, on_log, verbose=False)
+    _apply_logging_opts(opts, on_log, verbose=verbose)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -143,8 +165,9 @@ def list_available_languages(
     url: str,
     on_log: Optional[LogCallback] = None,
     cancel_event: Optional[CancelEvent] = None,
+    verbose: bool = False,
 ) -> tuple[dict, dict]:
-    info = probe(url, on_log=on_log, cancel_event=cancel_event)
+    info = probe(url, on_log=on_log, cancel_event=cancel_event, verbose=verbose)
     manual = info.get("subtitles") or {}
     auto = info.get("automatic_captions") or {}
     return manual, auto
@@ -279,6 +302,7 @@ def download_subtitles(
         "ignoreerrors": True,
         "restrictfilenames": False,
         "match_filter": _make_match_filter(cancel_event, title_pattern),
+        "extractor_args": _YOUTUBE_EXTRACTOR_ARGS,
     }
     _apply_logging_opts(ydl_opts, on_log, verbose=verbose)
     if on_log is not None:
