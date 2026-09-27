@@ -57,6 +57,19 @@ class TestMatchFilterTitleFiltering(unittest.TestCase):
         f = _make_match_filter(None, None)
         self.assertIsNone(f({"title": "anything at all"}))
 
+    def test_entries_without_title_are_not_rejected(self):
+        """Регрессия: yt-dlp вызывает match_filter не только на каждом
+        видео плейлиста, но и один раз на метаданных всего плейлиста
+        целиком (там есть "playlist", но нет "title"). Раньше фильтр
+        трактовал отсутствующий title как пустую строку и отклонял этот
+        псевдо-элемент, из-за чего весь плейлист обрывался ещё до того,
+        как начиналась обработка хотя бы одного настоящего видео."""
+        pattern = compile_title_filter(r"^1\.")
+        f = _make_match_filter(None, pattern)
+        self.assertIsNone(f({"playlist": "CompTIA Security+ Training Course"}))
+        self.assertIsNone(f({"title": ""}))
+        self.assertIsNone(f({}))
+
 
 if __name__ == "__main__":
     unittest.main()

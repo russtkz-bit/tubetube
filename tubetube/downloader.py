@@ -60,8 +60,13 @@ def _make_match_filter(
         if cancel_event is not None and cancel_event.is_set():
             raise yt_dlp.utils.DownloadCancelled("Отменено пользователем")
         if title_pattern is not None:
-            title = info_dict.get("title") or ""
-            if not title_pattern.search(title):
+            title = info_dict.get("title")
+            # yt-dlp вызывает match_filter не только для каждого видео, но и
+            # один раз для метаданных всего плейлиста целиком (у него нет
+            # поля "title", только "playlist"). Если title не известен —
+            # это не видео, и фильтровать нечего: пропускаем проверку,
+            # иначе плейлист обрывался бы целиком ещё до первого видео.
+            if title and not title_pattern.search(title):
                 return f"название не подходит под фильтр: {title!r}"
         return None
 
@@ -94,6 +99,10 @@ def _apply_logging_opts(opts: dict, on_log: Optional[LogCallback], verbose: bool
         opts["logger"] = _YdlLogger(on_log)
         opts["quiet"] = True
         opts["no_warnings"] = True
+        # Без этого yt-dlp иногда вставляет ANSI-коды подсветки в сообщения
+        # (думая, что пишет в цветной терминал) — в текстовом поле GUI они
+        # выглядят как мусор вроде "[0;32m".
+        opts["color"] = "no_color"
     else:
         opts["quiet"] = not verbose
         opts["no_warnings"] = not verbose
