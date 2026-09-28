@@ -103,6 +103,11 @@ class TestPartialDownloadWarning(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # Не спать реально _RETRY_COOLDOWN_SECONDS в каждом тесте с повтором.
+        sleep_patcher = mock.patch.object(downloader_module.time, "sleep", lambda _: None)
+        sleep_patcher.start()
+        self.addCleanup(sleep_patcher.stop)
+
     def _write_fake_vtt(self, name: str) -> str:
         path = str(Path(self.tmpdir) / name)
         Path(path).write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n", encoding="utf-8")

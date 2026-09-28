@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -250,6 +251,22 @@ def _parse_leading_index(path: Path) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+_RETRY_COOLDOWN_SECONDS = 10
+
+
+def _interruptible_sleep(seconds: float, cancel_event: Optional[CancelEvent]) -> None:
+    """time.sleep(), но проверяет отмену каждые полсекунды, а не только
+    до и после — иначе «Отмена» во время паузы перед повтором ждала бы
+    до конца этой паузы."""
+    step = 0.5
+    elapsed = 0.0
+    while elapsed < seconds:
+        _check_cancelled(cancel_event)
+        time.sleep(min(step, seconds - elapsed))
+        elapsed += step
+    _check_cancelled(cancel_event)
+
+
 def _retry_missing_matched_entries(
     ydl_opts: dict,
     url: str,
@@ -275,11 +292,21 @@ def _retry_missing_matched_entries(
     if on_log is not None:
         on_log(
             f"Не хватает {len(missing_indices)} файл(ов) после первого прохода "
-            f"(индексы: {', '.join(str(i) for i in missing_indices)}) — повторная попытка..."
+            f"(индексы: {', '.join(str(i) for i in missing_indices)}). Жду "
+            f"{_RETRY_COOLDOWN_SECONDS} секунд, чтобы ограничение YouTube по частоте "
+            "запросов успело сброситься, затем повторная попытка..."
         )
+    # Без паузы повтор запросов у YouTube может попасть в то же окно
+    # ограничения частоты запросов и снова получить 429 на те же самые
+    # видео (так и произошло на практике при мгновенном повторе).
+    _interruptible_sleep(_RETRY_COOLDOWN_SECONDS, cancel_event)
 
     retry_opts = dict(ydl_opts)
     retry_opts["playlist_items"] = ",".join(str(i) for i in missing_indices)
+    # Эти видео уже показали себя "капризными" — подстрахуемся паузами
+    # длиннее, чем в основном проходе.
+    retry_opts["sleep_interval_subtitles"] = max(ydl_opts.get("sleep_interval_subtitles", 0), 4)
+    retry_opts["sleep_interval_requests"] = max(ydl_opts.get("sleep_interval_requests", 0), 2)
 
     try:
         with yt_dlp.YoutubeDL(retry_opts) as ydl:
