@@ -156,6 +156,52 @@ class TestPartialDownloadWarning(unittest.TestCase):
         self.assertIn("2 файл(ов) из 3", warning)
         self.assertIn("--keep-vtt", warning)  # т.к. keep_vtt=False — совет его включить
 
+    def test_no_retry_and_clear_error_when_nothing_succeeded_at_all(self):
+        """Регрессия: реальный плейлист, --type manual (только авторские),
+        38 из 121 видео подошли под фильтр — но у канала нет авторских
+        субтитров вообще ни у одного видео (только автоматические).
+        Раньше это всё равно запускало полноценную повторную попытку
+        для всех 38 "недостающих" видео — бессмысленное ожидание в
+        реальном времени (полный проход по каждому), потому что причина
+        системная (не тот тип субтитров), а не разовый сбой сети.
+        Теперь: если не скачалось вообще ничего, повтор не запускается,
+        и сразу выдаётся понятная ошибка."""
+        info_nothing_succeeded = {"entries": [{"requested_subtitles": {}}, {"requested_subtitles": {}}]}
+
+        call_count = 0
+
+        class CountingFakeYDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def extract_info(self, url, download=True):
+                nonlocal call_count
+                call_count += 1
+                return info_nothing_succeeded
+
+        logs = []
+        with mock.patch.object(yt_dlp, "YoutubeDL", CountingFakeYDL):
+            with self.assertRaises(DownloadError) as ctx:
+                download_subtitles(
+                    "https://example.com/playlist",
+                    self.tmpdir,
+                    ["en"],
+                    sub_type="manual",
+                    title_filter=r"^1\.",
+                    on_log=logs.append,
+                )
+
+        self.assertEqual(call_count, 1, "Не должно быть повторной попытки, когда не скачалось вообще ничего")
+        self.assertIn("Субтитры не найдены", str(ctx.exception))
+        retry_line = next((line for line in logs if "повторная попытка" in line), None)
+        self.assertIsNone(retry_line, f"Повторной попытки быть не должно. Лог: {logs}")
+
     def test_retry_recovers_missing_file(self):
         """Первый проход недосчитался одного видео (как при HTTP 429),
         но автоматическая повторная попытка (playlist_items) его

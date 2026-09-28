@@ -398,7 +398,16 @@ def download_subtitles(
 
     written_vtt_files = sorted(_collect_subtitle_filepaths(info))
 
-    if expected_count is not None and len(written_vtt_files) < expected_count:
+    # Повторную попытку имеет смысл делать, только если хоть что-то уже
+    # скачалось — это признак, что механизм в целом работает и остальное
+    # не удалось скорее всего из-за разового сетевого сбоя (например,
+    # HTTP 429). Если не скачалось вообще ничего из подходящих под
+    # фильтр видео, причина обычно системная (например, выбран тип
+    # "только авторские", а у канала есть только автоматические
+    # субтитры) — повтор в этом случае бессмыслен и только заставит
+    # пользователя ждать (для полусотни видео — что реально произошло
+    # на практике), поэтому сразу переходим к понятной ошибке ниже.
+    if expected_count is not None and written_vtt_files and len(written_vtt_files) < expected_count:
         written_vtt_files = _retry_missing_matched_entries(
             ydl_opts, url, matched, written_vtt_files, on_log, cancel_event
         )
